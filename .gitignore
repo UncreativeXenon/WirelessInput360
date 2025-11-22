@@ -33,6 +33,7 @@ bld/
 [Oo]ut/
 [Ll]og/
 [Ll]ogs/
+!Windows/lib/*
 
 # Build results on 'Bin' directories
 **/[Bb]in/*
@@ -416,3 +417,7 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+XboxPlugin/WirelessInput360/Release RetailWirelessInput360.xdb
+XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.xex
+XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.lastbuildstate
+XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.exe
