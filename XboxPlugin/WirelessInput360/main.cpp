@@ -73,6 +73,12 @@ Detour XamInputGetCapabilitiesDetour;
 Detour XamInactivityDetectRecentActivityDetour;
 Detour XamInputSetStateDetour;
 
+// Global Socket for the hook to access
+SOCKET g_ServerSocket = INVALID_SOCKET;
+
+// Cache to prevent sending duplicate packets (spam reduction)
+XINPUT_VIBRATION g_LastVibration[4] = { {0,0}, {0,0}, {0,0}, {0,0} };
+
 uint16_t swap_endianness_16(uint16_t val) {
 	return (val >> 8) | (val << 8);
 }
@@ -325,6 +331,98 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 	}
 }
 
+void SendVibrationUpdate(int userIndex, unsigned short left, unsigned short right) {
+	if (g_ServerSocket == INVALID_SOCKET) return;
+
+	// OPTIMIZATION: Only send if the values changed
+	if (g_LastVibration[userIndex].wLeftMotorSpeed == left &&
+		g_LastVibration[userIndex].wRightMotorSpeed == right) {
+		return;
+	}
+
+	// Update the cache
+	g_LastVibration[userIndex].wLeftMotorSpeed = left;
+	g_LastVibration[userIndex].wRightMotorSpeed = right;
+
+	// 1. Format the message: "V:Index:Left:Right"
+	char msgBuf[64];
+	sprintf(msgBuf, "V:%d:%d:%d", userIndex, left, right);
+	std::string msg = msgBuf;
+
+	// 2. Build the WebSocket Frame (Masked)
+	std::vector<uint8_t> frame;
+	frame.push_back(0x81); // Byte 0: FIN + Text Opcode
+
+	// Byte 1: Mask Bit (0x80) + Payload Length
+	// (Assuming payload is short, < 126 bytes, which it is for this string)
+	frame.push_back(0x80 | (uint8_t)msg.length());
+
+	// Bytes 2-5: Generate Random Mask Key
+	uint8_t mask[4];
+	for (int i = 0; i < 4; i++) mask[i] = (uint8_t)(rand() % 0xFF);
+
+	frame.push_back(mask[0]);
+	frame.push_back(mask[1]);
+	frame.push_back(mask[2]);
+	frame.push_back(mask[3]);
+
+	// Bytes 6+: Payload (XOR Encrypted with Mask)
+	for (size_t i = 0; i < msg.length(); ++i) {
+		frame.push_back(msg[i] ^ mask[i % 4]);
+	}
+
+	// 3. Send using NetDll
+	NetDll_send(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP),
+		g_ServerSocket,
+		(const char*)frame.data(),
+		frame.size(),
+		0);
+}
+
+DWORD XamInputSetStateHook(DWORD user, DWORD flags, PXINPUT_VIBRATION pVibration, BYTE bAmplitude, BYTE bFrequency, BYTE bOffset) {
+    // Call the original first so the actual controller vibrates locally
+    DWORD status = XamInputSetStateDetour.GetOriginal<decltype(&XamInputSetStateHook)>()(user, flags, pVibration, bAmplitude, bFrequency, bOffset);
+
+	if ((user & 0xFF) == 0xFF)
+		user = 0;
+
+	if (status == ERROR_DEVICE_NOT_CONNECTED) {
+		ButtonsReport b;
+		Controller* c = nullptr;
+		for (int i = 0; i < (sizeof(connectedControllers) / sizeof(Controller)); i++) {
+			if (connectedControllers[i].ControllerStatus == ACTIVE) {
+				if (connectedControllers[i].userIndex == user) {
+					c = &connectedControllers[i];
+					b = connectedControllers[i].currentState;
+					break;
+				}
+			}
+		}
+
+		if (!c)
+			return status;
+
+		// Send to server
+		if (pVibration != nullptr) {
+			// userIndex might have flags (like 0xFF), mask them out if necessary, 
+			// though usually SetState receives a clean index (0-3).
+			int cleanIndex = user & 0xFF;
+
+			if (cleanIndex < 4) {
+				SendVibrationUpdate(cleanIndex, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+			}
+		}
+		else {
+			// If pVibration is null, it usually implies stop (0,0)
+			SendVibrationUpdate(user & 0xFF, 0, 0);
+		}
+
+		return ERROR_SUCCESS;
+	}
+
+    return status;
+}
+
 // fix for inactivity (screen dimming)
 int XamInactivityDetectRecentActivityHook(DWORD r3) {
 	// check if a controller is connected
@@ -464,6 +562,8 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         // ... Handshake processing ...
         DbgPrint("[WirelessInput360] Handshake response received\n");
 
+		g_ServerSocket = sock;
+
         // --- WebSocket main loop ---
         bool connectionActive = true;
         
@@ -542,6 +642,8 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 			}
 		}
 
+		g_ServerSocket = INVALID_SOCKET;
+
 		// Close the socket, but keep WSA loaded for the next attempt
 		NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
 		DbgPrint("[WirelessInput360] Connection lost. Retrying in 3s...\n");
@@ -553,6 +655,7 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 
 void* XamInputGetState = nullptr;
 void* XamInputGetCapabilitiesEx = nullptr;
+void* XamInputSetState = nullptr;
 bool isDevkit = true;
 
 bool initFunctionPointers() {
@@ -570,6 +673,7 @@ bool initFunctionPointers() {
 
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
 	XexGetProcedureAddress(xamHandle, 401, &XamInputGetState);
+	XexGetProcedureAddress(xamHandle, 402, &XamInputSetState);
 
 	if (isDevkit) {
 		DbgPrint("[WirelessInput360] Running in devkit mode\n");
@@ -680,11 +784,13 @@ BOOL DllMain(HINSTANCE hModule, DWORD reason, void* pReserved)
 
 		strcat(pluginPath, "WirelessInput360.ini");
 
-		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
 		XamInputGetStateDetour = Detour(XamInputGetState, (void*)XamInputGetStateHook);
+		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
+		XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
 
 		XamInputGetStateDetour.Install();
 		XamInputGetCapabilitiesDetour.Install();
+		XamInputSetStateDetour.Install();
 		XamInactivityDetectRecentActivityDetour.Install();
 
 		DbgPrint("[WirelessInput360] Hooks installed\n");
@@ -694,6 +800,7 @@ BOOL DllMain(HINSTANCE hModule, DWORD reason, void* pReserved)
 	else if (reason == DLL_PROCESS_DETACH) {
 		XamInputGetStateDetour.Remove();
 		XamInputGetCapabilitiesDetour.Remove();
+		XamInputSetStateDetour.Remove();
 		XamInactivityDetectRecentActivityDetour.Remove();
 
 		port = 3000;

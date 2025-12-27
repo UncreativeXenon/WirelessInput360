@@ -33,6 +33,14 @@ SOCKET clientSocket = INVALID_SOCKET;
 std::mutex clientMutex;
 std::atomic<bool> serverRunning(true);
 
+struct PlayerSlot {
+    bool active = false;
+    SDL_JoystickID instance_id = 0;
+    SDL_Gamepad* gamepad = nullptr;
+};
+
+PlayerSlot players[MAX_PLAYERS];
+
 // --- NEW FUNCTION: READ PORT FROM FILE ---
 int ReadPortFromFile() {
     std::ifstream portFile("port.txt");
@@ -116,6 +124,40 @@ void SendWebSocketMessage(const std::string& msg) {
     }
 }
 
+void ApplyVibrationCommand(const std::string& msg) {
+    // Expected Format: "V:0:65535:65535"
+    if (msg.empty() || msg[0] != 'V') return;
+
+    try {
+        std::stringstream ss(msg.substr(2)); // Skip "V:"
+        std::string segment;
+        std::vector<int> values;
+
+        while (std::getline(ss, segment, ':')) {
+            values.push_back(std::stoi(segment));
+        }
+
+        if (values.size() == 3) {
+            int pIdx = values[0];
+            int lowFreq = values[1];  // Left Motor (Heavy)
+            int highFreq = values[2]; // Right Motor (Light)
+
+            // Safety check
+            if (pIdx >= 0 && pIdx < MAX_PLAYERS && players[pIdx].active) {
+                // The client should send updates frequently to keep it going or send 0 to stop.
+                SDL_RumbleGamepad(players[pIdx].gamepad,
+                    (Uint16)lowFreq,
+                    (Uint16)highFreq,
+                    200);
+                // std::cout << "Rumble Set: P" << pIdx << " L:" << lowFreq << " R:" << highFreq << std::endl;
+            }
+        }
+    }
+    catch (...) {
+        std::cerr << "[WS] Invalid Rumble Command: " << msg << std::endl;
+    }
+}
+
 // --- SERVER THREAD ---
 void WebSocketServerThread() {
     WSADATA wsaData;
@@ -189,10 +231,45 @@ void WebSocketServerThread() {
                 // 6. Monitor connection (Simple blocking read until disconnect)
                 // We don't really need to read anything for this app, but recv will return 0 or -1 on disconnect
                 while (true) {
-                    int check = recv(client, buffer, 2048, 0);
-                    if (check <= 0) {
+                    int bytesRead = recv(client, buffer, 2048, 0);
+                    if (bytesRead <= 0) {
                         std::cout << "[WS] Client disconnected." << std::endl;
                         break;
+                    }
+
+                    if (bytesRead < 6) continue; // Too small to be a valid masked frame
+
+                    uint8_t b0 = (uint8_t)buffer[0];
+                    uint8_t b1 = (uint8_t)buffer[1];
+
+                    // Check if it's a disconnect opcode (0x88)
+                    if ((b0 & 0x0F) == 0x08) {
+                        std::cout << "[WS] Client sent close frame." << std::endl;
+                        break;
+                    }
+
+                    bool isMasked = (b1 & 0x80) != 0;
+                    int payloadLen = b1 & 0x7F;
+
+                    if (payloadLen < 126 && isMasked && bytesRead >= (6 + payloadLen)) {
+
+                        // Mask keys are at bytes 2, 3, 4, 5
+                        uint8_t mask[4];
+                        mask[0] = buffer[2];
+                        mask[1] = buffer[3];
+                        mask[2] = buffer[4];
+                        mask[3] = buffer[5];
+
+                        // Payload starts at byte 6
+                        std::string decodedMsg = "";
+                        for (int i = 0; i < payloadLen; ++i) {
+                            // Unmask: Data XOR Mask
+                            char c = buffer[6 + i] ^ mask[i % 4];
+                            decodedMsg += c;
+                        }
+
+                        // Process the clean message
+                        ApplyVibrationCommand(decodedMsg);
                     }
                 }
 
@@ -214,14 +291,6 @@ void WebSocketServerThread() {
 }
 
 // --- GAMEPAD LOGIC ---
-
-struct PlayerSlot {
-    bool active = false;
-    SDL_JoystickID instance_id = 0;
-    SDL_Gamepad* gamepad = nullptr;
-};
-
-PlayerSlot players[MAX_PLAYERS];
 
 int GetPlayerIndex(SDL_JoystickID id) {
     for (int i = 0; i < MAX_PLAYERS; ++i) {
