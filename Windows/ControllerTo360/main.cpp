@@ -148,7 +148,7 @@ void ApplyVibrationCommand(const std::string& msg) {
                 SDL_RumbleGamepad(players[pIdx].gamepad,
                     (Uint16)lowFreq,
                     (Uint16)highFreq,
-                    200);
+                    100);
                 // std::cout << "Rumble Set: P" << pIdx << " L:" << lowFreq << " R:" << highFreq << std::endl;
             }
         }
